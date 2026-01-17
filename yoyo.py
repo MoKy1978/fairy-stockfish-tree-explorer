@@ -177,6 +177,13 @@ class Tree:
     storing them in NumPy arrays for efficient memory usage and fast access.
     """
     EDGE_DTYPE = np.dtype([('move', 'S5'), ('eval', '<i2'), ('child', '<i4')])
+    
+    # Configuration constants for performance tuning
+    WRITE_BUFFER_SIZE = 128 * 1024  # 128KB buffer for file writes
+    FLUSH_INTERVAL = 1_000_000      # Flush file every 1M nodes
+    PRINT_INTERVAL = 1024           # Print game progress every 1024 games
+    SAVE_INTERVAL = 65536           # Save tree every 65536 games
+    EVALUATION_THRESHOLD = 64       # Evaluation difference threshold for alternative exploration
 
     def __init__(self):
         """Initialize the Tree with an engine and load existing data if available."""
@@ -359,7 +366,7 @@ class Tree:
 
         # Write to temporary file with buffering, then atomically replace
         temp_path = Path(EPD + '.tmp')
-        with open(temp_path, 'w', buffering=8192 * 16) as file:  # 128KB buffer for better performance
+        with open(temp_path, 'w', buffering=self.WRITE_BUFFER_SIZE) as file:
             for i, node_id in enumerate(np.nonzero(reachable)[0]):
                 fen = self.node_fen[node_id].decode()
                 offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
@@ -369,7 +376,7 @@ class Tree:
                 children = ','.join(str(self.edges[offset + j]['child']) for j in range(num_edges))
                 file.write(f'{node_id};{fen};{moves};{evaluations};{children};{all_moves_flag};\n')
                 # Flush periodically to avoid excessive memory usage
-                if i % 1000000 == 0:
+                if i % self.FLUSH_INTERVAL == 0:
                     file.flush()
         
         # Atomic replacement - ensures file integrity even if process is interrupted
@@ -687,9 +694,9 @@ class Tree:
             """End current game exploration and prepare for backtracking."""
             nonlocal game_count, direction
             game_count += 1
-            if game_count % 1024 == 0:
+            if game_count % self.PRINT_INTERVAL == 0:
                 print(f"[{game_count}] {self.path_to_game(path, suffix)}")
-            if game_count % 65536 == 0:
+            if game_count % self.SAVE_INTERVAL == 0:
                 # Periodic backpropagation and saving
                 for node_id, _ in reversed(path):
                     self.backprop_node(node_id)
@@ -791,7 +798,7 @@ class Tree:
                                 alt_edge_evaluation = self.edges[parent_offset + parent_num_edges - 1]['eval']
 
                     # Switch to alternative if it's significantly better
-                    if best_alt_index >= 0 and alt_edge_evaluation > used_edge_evaluation + 64 * len(path):
+                    if best_alt_index >= 0 and alt_edge_evaluation > used_edge_evaluation + self.EVALUATION_THRESHOLD * len(path):
                         self.shift_eval_to_zero(parent_id, best_alt_index)
 
                         child_id = self.edges[parent_offset + best_alt_index]['child']
