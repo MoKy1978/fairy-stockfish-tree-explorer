@@ -179,11 +179,11 @@ class Tree:
     EDGE_DTYPE = np.dtype([('move', 'S5'), ('eval', '<i2'), ('child', '<i4')])
     
     # Configuration constants for performance tuning
-    WRITE_BUFFER_SIZE = 128 * 1024  # 128KB buffer for file writes
-    FLUSH_INTERVAL = 1_000_000      # Flush file every 1M nodes
+    FLUSH_INTERVAL = 1_000_000      # Flush file every 1M nodes during save
     PRINT_INTERVAL = 1024           # Print game progress every 1024 games
     SAVE_INTERVAL = 65536           # Save tree every 65536 games
-    EVALUATION_THRESHOLD = 64       # Evaluation difference threshold for alternative exploration
+    EVALUATION_THRESHOLD = 64       # Base evaluation difference threshold for alternative exploration
+    MAX_PATH_SCALING = 1000         # Maximum path length for evaluation threshold scaling
 
     def __init__(self):
         """Initialize the Tree with an engine and load existing data if available."""
@@ -206,35 +206,18 @@ class Tree:
     def _grow_nodes(self, min_capacity):
         """Grow node arrays to accommodate more nodes.
         
-        Uses efficient array pre-allocation instead of incremental resizing
-        to reduce memory fragmentation and improve performance.
+        Uses NumPy's efficient resize operation with clear variable names
+        for better code readability.
         
         Args:
             min_capacity: Minimum required capacity
         """
         new_capacity = max(min_capacity, self.node_capacity + 1_000_000)
-        
-        # Pre-allocate new arrays and copy old data - more efficient than resize
-        new_node_fen = np.zeros(new_capacity, dtype='S28')
-        new_node_fen[:self.node_count] = self.node_fen[:self.node_count]
-        self.node_fen = new_node_fen
-        
-        new_node_offset = np.zeros(new_capacity, dtype=np.uint32)
-        new_node_offset[:self.node_count] = self.node_offset[:self.node_count]
-        self.node_offset = new_node_offset
-        
-        new_node_num_edges = np.zeros(new_capacity, dtype=np.uint8)
-        new_node_num_edges[:self.node_count] = self.node_num_edges[:self.node_count]
-        self.node_num_edges = new_node_num_edges
-        
-        new_node_all_moves = np.zeros(new_capacity, dtype=np.bool_)
-        new_node_all_moves[:self.node_count] = self.node_all_moves[:self.node_count]
-        self.node_all_moves = new_node_all_moves
-        
-        new_node_refcount = np.zeros(new_capacity, dtype=np.uint32)
-        new_node_refcount[:self.node_count] = self.node_refcount[:self.node_count]
-        self.node_refcount = new_node_refcount
-        
+        self.node_fen = np.resize(self.node_fen, new_capacity)
+        self.node_offset = np.resize(self.node_offset, new_capacity)
+        self.node_num_edges = np.resize(self.node_num_edges, new_capacity)
+        self.node_all_moves = np.resize(self.node_all_moves, new_capacity)
+        self.node_refcount = np.resize(self.node_refcount, new_capacity)
         self.node_capacity = new_capacity
 
     def _grow_edges(self, min_capacity):
@@ -364,9 +347,9 @@ class Tree:
                 if fen in self.fen_to_id:
                     del self.fen_to_id[fen]
 
-        # Write to temporary file with buffering, then atomically replace
+        # Write to temporary file, then atomically replace
         temp_path = Path(EPD + '.tmp')
-        with open(temp_path, 'w', buffering=self.WRITE_BUFFER_SIZE) as file:
+        with open(temp_path, 'w') as file:
             for i, node_id in enumerate(np.nonzero(reachable)[0]):
                 fen = self.node_fen[node_id].decode()
                 offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
@@ -798,7 +781,9 @@ class Tree:
                                 alt_edge_evaluation = self.edges[parent_offset + parent_num_edges - 1]['eval']
 
                     # Switch to alternative if it's significantly better
-                    if best_alt_index >= 0 and alt_edge_evaluation > used_edge_evaluation + self.EVALUATION_THRESHOLD * len(path):
+                    # Use bounded path length to prevent overflow with deep paths
+                    path_scaling = min(len(path), self.MAX_PATH_SCALING)
+                    if best_alt_index >= 0 and alt_edge_evaluation > used_edge_evaluation + self.EVALUATION_THRESHOLD * path_scaling:
                         self.shift_eval_to_zero(parent_id, best_alt_index)
 
                         child_id = self.edges[parent_offset + best_alt_index]['child']
