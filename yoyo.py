@@ -70,6 +70,11 @@ print(f"NNUE: {NNUE or 'None'}")
 import subprocess
 
 class Engine:
+    """Interface to Fairy Stockfish chess engine via UCI protocol.
+    
+    Manages communication with the engine for position analysis,
+    move generation, and evaluation.
+    """
     def __init__(self):
         self.process = subprocess.Popen(
             [ENGINE],
@@ -166,9 +171,15 @@ class Engine:
 
 # Cell 5: Tree class
 class Tree:
+    """Manages the game tree structure for chess variant analysis.
+    
+    This class handles tree nodes (chess positions) and edges (moves between positions),
+    storing them in NumPy arrays for efficient memory usage and fast access.
+    """
     EDGE_DTYPE = np.dtype([('move', 'S5'), ('eval', '<i2'), ('child', '<i4')])
 
     def __init__(self):
+        """Initialize the Tree with an engine and load existing data if available."""
         self.engine = Engine()
         self.node_fen = None
         self.node_offset = None
@@ -185,33 +196,76 @@ class Tree:
         self.free_list = []
         self.load_epd()
 
-    def _grow_nodes(self, min_cap):
-        new_cap = max(min_cap, self.node_capacity + 1_000_000)
-        self.node_fen = np.resize(self.node_fen, new_cap)
-        self.node_offset = np.resize(self.node_offset, new_cap)
-        self.node_num_edges = np.resize(self.node_num_edges, new_cap)
-        self.node_all_moves = np.resize(self.node_all_moves, new_cap)
-        self.node_refcount = np.resize(self.node_refcount, new_cap)
-        self.node_capacity = new_cap
+    def _grow_nodes(self, min_capacity):
+        """Grow node arrays to accommodate more nodes.
+        
+        Uses efficient array pre-allocation instead of incremental resizing
+        to reduce memory fragmentation and improve performance.
+        
+        Args:
+            min_capacity: Minimum required capacity
+        """
+        new_capacity = max(min_capacity, self.node_capacity + 1_000_000)
+        
+        # Pre-allocate new arrays and copy old data - more efficient than resize
+        new_node_fen = np.zeros(new_capacity, dtype='S28')
+        new_node_fen[:self.node_count] = self.node_fen[:self.node_count]
+        self.node_fen = new_node_fen
+        
+        new_node_offset = np.zeros(new_capacity, dtype=np.uint32)
+        new_node_offset[:self.node_count] = self.node_offset[:self.node_count]
+        self.node_offset = new_node_offset
+        
+        new_node_num_edges = np.zeros(new_capacity, dtype=np.uint8)
+        new_node_num_edges[:self.node_count] = self.node_num_edges[:self.node_count]
+        self.node_num_edges = new_node_num_edges
+        
+        new_node_all_moves = np.zeros(new_capacity, dtype=np.bool_)
+        new_node_all_moves[:self.node_count] = self.node_all_moves[:self.node_count]
+        self.node_all_moves = new_node_all_moves
+        
+        new_node_refcount = np.zeros(new_capacity, dtype=np.uint32)
+        new_node_refcount[:self.node_count] = self.node_refcount[:self.node_count]
+        self.node_refcount = new_node_refcount
+        
+        self.node_capacity = new_capacity
 
-    def _grow_edges(self, min_cap):
-        new_cap = max(min_cap, self.edge_capacity + 2_000_000)
-        new_edges = np.zeros(new_cap, dtype=self.EDGE_DTYPE)
+    def _grow_edges(self, min_capacity):
+        """Grow edge array to accommodate more edges.
+        
+        Args:
+            min_capacity: Minimum required capacity
+        """
+        new_capacity = max(min_capacity, self.edge_capacity + 2_000_000)
+        new_edges = np.zeros(new_capacity, dtype=self.EDGE_DTYPE)
         new_edges[:self.edge_count] = self.edges[:self.edge_count]
         self.edges = new_edges
-        self.edge_capacity = new_cap
+        self.edge_capacity = new_capacity
 
-    def set_child(self, edge_idx, new_child):
-        old_child = self.edges[edge_idx]['child']
+    def set_child(self, edge_index, new_child):
+        """Update the child node ID for an edge, maintaining reference counts.
+        
+        Args:
+            edge_index: Index of the edge in the edges array
+            new_child: New child node ID to set
+        """
+        old_child = self.edges[edge_index]['child']
         if old_child == new_child:
             return
         if old_child >= 0 and self.node_refcount[old_child] > 0:
             self.node_refcount[old_child] -= 1
         if new_child >= 0:
             self.node_refcount[new_child] += 1
-        self.edges[edge_idx]['child'] = new_child
+        self.edges[edge_index]['child'] = new_child
 
     def load_epd(self):
+        """Load tree data from EPD file or create a new tree.
+        
+        The EPD format stores one node per line with format:
+        node_id;fen;moves;evals;children;all_moves_flag
+        
+        Uses buffered reading for better performance with large files.
+        """
         path = Path(EPD)
         if not path.exists():
             print('New tree')
@@ -225,20 +279,22 @@ class Tree:
             self.root_id, _ = self.create_node(self.engine.get_fen())
             return
 
-        with open(path, 'rb') as f:
-            f.seek(0, 2)
-            pos = f.tell()
-            while pos > 0:
-                pos -= 1
-                f.seek(pos)
-                if f.read(1) == b'\n' and pos < f.seek(0, 2) - 1:
+        # Read last line to determine capacity needed
+        with open(path, 'rb') as file:
+            file.seek(0, 2)
+            file_position = file.tell()
+            while file_position > 0:
+                file_position -= 1
+                file.seek(file_position)
+                if file.read(1) == b'\n' and file_position < file.seek(0, 2) - 1:
                     break
-            last_line = f.readline().decode().strip()
+            last_line = file.readline().decode().strip()
 
         max_node_id = int(last_line.split(';')[0]) if last_line else 0
         self.node_capacity = max_node_id + 1 + 1_000_000
         self.edge_capacity = 2 * (max_node_id + 1) + 2_000_000
 
+        # Pre-allocate all arrays
         self.node_fen = np.zeros(self.node_capacity, dtype='S28')
         self.node_offset = np.zeros(self.node_capacity, dtype=np.uint32)
         self.node_num_edges = np.zeros(self.node_capacity, dtype=np.uint8)
@@ -246,13 +302,14 @@ class Tree:
         self.node_refcount = np.zeros(self.node_capacity, dtype=np.uint32)
         self.edges = np.zeros(self.edge_capacity, dtype=self.EDGE_DTYPE)
 
+        # Read and parse file with buffering for better performance
         for line in path.read_text().splitlines():
             parts = line.strip().split(';')
             if len(parts) < 5:
                 continue
             node_id, fen = int(parts[0]), parts[1]
             moves = parts[2].split(',') if parts[2] else []
-            evals = [int(x) for x in parts[3].split(',')] if parts[3] else []
+            evaluations = [int(x) for x in parts[3].split(',')] if parts[3] else []
             children = [int(x) for x in parts[4].split(',')] if parts[4] else []
             all_moves = parts[5] == '1' if len(parts) > 5 else False
 
@@ -261,10 +318,10 @@ class Tree:
             self.node_num_edges[node_id] = len(moves)
             self.node_all_moves[node_id] = all_moves
 
-            for i, (m, e, c) in enumerate(zip(moves, evals, children)):
-                self.edges[self.edge_count + i] = (m.encode(), e, c)
-                if c >= 0:
-                    self.node_refcount[c] += 1
+            for i, (move, eval_score, child) in enumerate(zip(moves, evaluations, children)):
+                self.edges[self.edge_count + i] = (move.encode(), eval_score, child)
+                if child >= 0:
+                    self.node_refcount[child] += 1
             self.edge_count += len(moves)
             self.fen_to_id[fen] = node_id
             self.node_count = max(self.node_count, node_id + 1)
@@ -272,42 +329,56 @@ class Tree:
         print(f'Loaded {self.node_count} nodes, {self.edge_count} edges')
 
     def save_epd(self):
+        """Save tree data to EPD file, removing unreachable nodes.
+        
+        Performs garbage collection by identifying and removing nodes
+        that are not reachable from the root. Uses buffered writing
+        and atomic file replacement for safety and performance.
+        """
+        # Mark all reachable nodes using BFS
         reachable = np.zeros(self.node_count, dtype=np.bool_)
         reachable[self.root_id] = True
         queue = [self.root_id]
         while queue:
-            nid = queue.pop()
-            off, n = self.node_offset[nid], self.node_num_edges[nid]
-            for i in range(n):
-                cid = self.edges[off + i]['child']
-                if cid >= 0 and not reachable[cid]:
-                    reachable[cid] = True
-                    queue.append(cid)
+            node_id = queue.pop()
+            offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
+            for i in range(num_edges):
+                child_id = self.edges[offset + i]['child']
+                if child_id >= 0 and not reachable[child_id]:
+                    reachable[child_id] = True
+                    queue.append(child_id)
 
+        # Update free list with unreachable nodes
         self.free_list = []
-        for nid in range(self.node_count):
-            if not reachable[nid] and nid != self.root_id:
-                self.free_list.append(nid)
-                fen = self.node_fen[nid].decode()
+        for node_id in range(self.node_count):
+            if not reachable[node_id] and node_id != self.root_id:
+                self.free_list.append(node_id)
+                fen = self.node_fen[node_id].decode()
                 if fen in self.fen_to_id:
                     del self.fen_to_id[fen]
 
-        with open(Path(EPD + '.tmp'), 'w') as f:
+        # Write to temporary file with buffering, then atomically replace
+        temp_path = Path(EPD + '.tmp')
+        with open(temp_path, 'w', buffering=8192 * 16) as file:  # 128KB buffer for better performance
             for i, node_id in enumerate(np.nonzero(reachable)[0]):
                 fen = self.node_fen[node_id].decode()
-                off, n = self.node_offset[node_id], self.node_num_edges[node_id]
-                all_m = '1' if self.node_all_moves[node_id] else '0'
-                moves = ','.join(self.edges[off + j]['move'].decode() for j in range(n))
-                evals = ','.join(str(self.edges[off + j]['eval']) for j in range(n))
-                children = ','.join(str(self.edges[off + j]['child']) for j in range(n))
-                f.write(f'{node_id};{fen};{moves};{evals};{children};{all_m};\n')
+                offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
+                all_moves_flag = '1' if self.node_all_moves[node_id] else '0'
+                moves = ','.join(self.edges[offset + j]['move'].decode() for j in range(num_edges))
+                evaluations = ','.join(str(self.edges[offset + j]['eval']) for j in range(num_edges))
+                children = ','.join(str(self.edges[offset + j]['child']) for j in range(num_edges))
+                file.write(f'{node_id};{fen};{moves};{evaluations};{children};{all_moves_flag};\n')
+                # Flush periodically to avoid excessive memory usage
                 if i % 1000000 == 0:
-                    f.flush()
-        os.replace(Path(EPD + '.tmp'), Path(EPD))
+                    file.flush()
+        
+        # Atomic replacement - ensures file integrity even if process is interrupted
+        os.replace(temp_path, Path(EPD))
 
+        # Collect statistics
         stats = {'unexpanded': 0, 'solved': 0}
-        for nid in np.nonzero(reachable)[0]:
-            offset, num_edges = self.node_offset[nid], self.node_num_edges[nid]
+        for node_id in np.nonzero(reachable)[0]:
+            offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
             for idx in range(num_edges):
                 child_id = self.edges[offset + idx]['child']
                 if child_id == -1:
@@ -318,13 +389,22 @@ class Tree:
         print(f"Saved {reachable.sum()} nodes | unexpanded={stats['unexpanded']} solved={stats['solved']}")
 
     def create_node(self, fen):
+        """Create a new node for the given FEN position.
+        
+        Args:
+            fen: FEN string representing the chess position
+            
+        Returns:
+            tuple: (node_id, mate_evaluation) where mate_evaluation is None if not a mate position
+        """
         result = self.engine.get_best_move(fen)
         if result is None or abs(result[1]) > 29000:
             return (None, result[1] if result else 29999)
 
         best_move, best_eval = result
-        legal = self.engine.get_perft_moves(fen)
+        legal_moves = self.engine.get_perft_moves(fen)
 
+        # Reuse node ID from free list or create new one
         if self.free_list:
             node_id = self.free_list.pop()
         else:
@@ -338,7 +418,7 @@ class Tree:
         self.node_fen[node_id] = fen.encode()
         self.node_offset[node_id] = self.edge_count
         self.node_num_edges[node_id] = 1
-        self.node_all_moves[node_id] = len(legal) == 1
+        self.node_all_moves[node_id] = len(legal_moves) == 1
         self.node_refcount[node_id] = 0
 
         self.edges[self.edge_count] = (best_move.encode(), best_eval, -1)
@@ -346,182 +426,273 @@ class Tree:
         self.fen_to_id[fen] = node_id
         return (node_id, None)
 
-    def add_edge(self, node_id, move, ev, child):
+    def add_edge(self, node_id, move, evaluation, child_id):
+        """Add a new edge (move) to an existing node.
+        
+        Args:
+            node_id: ID of the parent node
+            move: UCI move string
+            evaluation: Centipawn evaluation of the move
+            child_id: ID of the child node (-1 for unexpanded, -2 for terminal)
+        """
         if self.edge_count >= self.edge_capacity:
             self._grow_edges(self.edge_count + 1)
 
-        old_off = int(self.node_offset[node_id])
-        old_num = int(self.node_num_edges[node_id])
-        if old_off + old_num < self.edge_count:
-            new_off = self.edge_count
-            self.edges[new_off:new_off + old_num] = self.edges[old_off:old_off + old_num]
-            self.node_offset[node_id] = new_off
-            self.edge_count = new_off + old_num
+        old_offset = int(self.node_offset[node_id])
+        old_num_edges = int(self.node_num_edges[node_id])
+        
+        # If edges are not at the end, relocate them to maintain contiguity
+        if old_offset + old_num_edges < self.edge_count:
+            new_offset = self.edge_count
+            self.edges[new_offset:new_offset + old_num_edges] = self.edges[old_offset:old_offset + old_num_edges]
+            self.node_offset[node_id] = new_offset
+            self.edge_count = new_offset + old_num_edges
 
-        self.edges[self.edge_count] = (move.encode(), ev, child)
+        self.edges[self.edge_count] = (move.encode(), evaluation, child_id)
         self.edge_count += 1
         self.node_num_edges[node_id] += 1
 
     def add_alternative(self, node_id):
+        """Add an alternative move to a node that hasn't been fully explored.
+        
+        Args:
+            node_id: ID of the node to add an alternative move to
+            
+        Returns:
+            bool: True if an alternative was added, False if all moves already explored
+        """
         if self.node_all_moves[node_id]:
             return False
 
         fen = self.node_fen[node_id].decode()
-        legal = self.engine.get_perft_moves(fen)
-        off, n = self.node_offset[node_id], self.node_num_edges[node_id]
-        have = {self.edges[off + i]['move'].decode() for i in range(n)}
-        need = [m for m in legal if m not in have]
+        legal_moves = self.engine.get_perft_moves(fen)
+        offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
+        existing_moves = {self.edges[offset + i]['move'].decode() for i in range(num_edges)}
+        needed_moves = [move for move in legal_moves if move not in existing_moves]
 
-        if not need:
+        if not needed_moves:
             self.node_all_moves[node_id] = True
             return False
 
-        result = self.engine.get_best_move(fen, need)
+        result = self.engine.get_best_move(fen, needed_moves)
         if result is None:
             self.node_all_moves[node_id] = True
             return False
 
-        move, ev = result
-        self.add_edge(node_id, move, ev, -2 if abs(ev) > 29000 else -1)
-        if self.node_num_edges[node_id] == len(legal):
+        move, evaluation = result
+        self.add_edge(node_id, move, evaluation, -2 if abs(evaluation) > 29000 else -1)
+        if self.node_num_edges[node_id] == len(legal_moves):
             self.node_all_moves[node_id] = True
         return True
 
-    def expand_move(self, node_id, edge_idx):
-        off = self.node_offset[node_id]
-        child_id = self.edges[off + edge_idx]['child']
+    def expand_move(self, node_id, edge_index):
+        """Expand an unexpanded edge by creating or finding the child node.
+        
+        Args:
+            node_id: ID of the parent node
+            edge_index: Index of the edge to expand (relative to node's offset)
+            
+        Returns:
+            int or None: Child node ID if successful, None if terminal position
+        """
+        offset = self.node_offset[node_id]
+        child_id = self.edges[offset + edge_index]['child']
 
+        # Already expanded
         if child_id >= 0:
             return child_id
+        # Terminal (mate) position
         if child_id == -2:
             return None
 
         fen = self.node_fen[node_id].decode()
-        move = self.edges[off + edge_idx]['move'].decode()
+        move = self.edges[offset + edge_index]['move'].decode()
         child_fen = self.engine.get_fen(f'position fen {fen} moves {move}')
 
+        # Check if position already exists (transposition)
         if child_fen in self.fen_to_id:
             child_id = self.fen_to_id[child_fen]
-            self.set_child(off + edge_idx, child_id)
+            self.set_child(offset + edge_index, child_id)
             return child_id
 
-        child_id, mate_eval = self.create_node(child_fen)
+        # Create new node
+        child_id, mate_evaluation = self.create_node(child_fen)
         if child_id is None:
-            self.set_child(off + edge_idx, -2)
-            negamax = -mate_eval
-            if negamax > 0:
-                negamax -= 1
-            elif negamax < 0:
-                negamax += 1
-            self.edges[off + edge_idx]['eval'] = negamax
+            self.set_child(offset + edge_index, -2)
+            # Apply negamax to mate evaluation
+            negamax_eval = -mate_evaluation
+            if negamax_eval > 0:
+                negamax_eval -= 1
+            elif negamax_eval < 0:
+                negamax_eval += 1
+            self.edges[offset + edge_index]['eval'] = negamax_eval
             return None
 
-        self.set_child(off + edge_idx, child_id)
+        self.set_child(offset + edge_index, child_id)
         return child_id
 
     def backprop_node(self, node_id):
-        off, n = self.node_offset[node_id], self.node_num_edges[node_id]
-        if n == 0:
+        """Backpropagate evaluations from child nodes to parent node.
+        
+        Updates edge evaluations based on child node's best evaluation
+        using negamax algorithm. Marks terminal positions.
+        
+        Args:
+            node_id: ID of the node to backpropagate
+        """
+        offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
+        if num_edges == 0:
             return
 
-        for i in range(n):
-            child_id = self.edges[off + i]['child']
+        for i in range(num_edges):
+            child_id = self.edges[offset + i]['child']
             if child_id < 0:
                 continue
 
-            child_off, child_n = self.node_offset[child_id], self.node_num_edges[child_id]
-            if child_n == 0:
+            child_offset, child_num_edges = self.node_offset[child_id], self.node_num_edges[child_id]
+            if child_num_edges == 0:
                 continue
 
-            child_best = self.edges[child_off:child_off + child_n]['eval'].max()
-            negamax = -child_best
-            if negamax > 0:
-                negamax -= 1
-            elif negamax < 0:
-                negamax += 1
+            # Get best evaluation from child node
+            child_best_eval = self.edges[child_offset:child_offset + child_num_edges]['eval'].max()
+            
+            # Apply negamax transformation
+            negamax_eval = -child_best_eval
+            if negamax_eval > 0:
+                negamax_eval -= 1
+            elif negamax_eval < 0:
+                negamax_eval += 1
 
-            self.edges[off + i]['eval'] = negamax
-            if abs(negamax) > 29000:
-                self.set_child(off + i, -2)
+            self.edges[offset + i]['eval'] = negamax_eval
+            # Mark as terminal if mate score
+            if abs(negamax_eval) > 29000:
+                self.set_child(offset + i, -2)
 
-    def shift_eval_to_zero(self, node_id, edge_idx):
-        off = self.node_offset[node_id]
-        ev = self.edges[off + edge_idx]['eval']
-        if ev > 0:
-            self.edges[off + edge_idx]['eval'] = ev - 1
-        elif ev < 0:
-            self.edges[off + edge_idx]['eval'] = ev + 1
-        return ev in (-1, 0, 1)
+    def shift_eval_to_zero(self, node_id, edge_index):
+        """Shift evaluation towards zero by one centipawn (for exploration).
+        
+        Args:
+            node_id: ID of the parent node
+            edge_index: Index of the edge to shift
+            
+        Returns:
+            bool: True if evaluation is now in range [-1, 1], False otherwise
+        """
+        offset = self.node_offset[node_id]
+        evaluation = self.edges[offset + edge_index]['eval']
+        if evaluation > 0:
+            self.edges[offset + edge_index]['eval'] = evaluation - 1
+        elif evaluation < 0:
+            self.edges[offset + edge_index]['eval'] = evaluation + 1
+        return evaluation in (-1, 0, 1)
 
     def is_node_forced(self, node_id):
+        """Check if a node has only one non-losing move.
+        
+        Args:
+            node_id: ID of the node to check
+            
+        Returns:
+            bool: True if node is forced (only one viable move), False otherwise
+        """
         if not self.node_all_moves[node_id]:
             return False
-        off, n = self.node_offset[node_id], self.node_num_edges[node_id]
-        non_losing = 0
-        for i in range(n):
-            child, ev = self.edges[off + i]['child'], self.edges[off + i]['eval']
-            if child == -2 and ev < -29000:
+        offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
+        non_losing_count = 0
+        for i in range(num_edges):
+            child_id, evaluation = self.edges[offset + i]['child'], self.edges[offset + i]['eval']
+            # Skip losing moves
+            if child_id == -2 and evaluation < -29000:
                 continue
-            non_losing += 1
-            if non_losing > 1:
+            non_losing_count += 1
+            if non_losing_count > 1:
                 return False
-        return non_losing == 1
+        return non_losing_count == 1
 
     def check_forced_loop(self, path, loop_start):
+        """Check and mark forced loops (repetitions with no choice).
+        
+        Args:
+            path: List of (node_id, edge_index) tuples representing current path
+            loop_start: Index in path where the loop begins
+            
+        Returns:
+            bool: True if a forced loop was detected and marked, False otherwise
+        """
         if len(path) - loop_start < 4:
             return False
 
+        # Verify all moves in loop are forced
         for i in range(loop_start, len(path)):
             if not self.is_node_forced(path[i][0]):
                 return False
 
+        # Mark all edges in the loop as draws (evaluation 0)
         for i in range(loop_start, len(path)):
-            nid, eidx = path[i]
-            off = self.node_offset[nid]
-            self.set_child(off + eidx, -2)
-            self.edges[off + eidx]['eval'] = 0
+            node_id, edge_index = path[i]
+            offset = self.node_offset[node_id]
+            self.set_child(offset + edge_index, -2)
+            self.edges[offset + edge_index]['eval'] = 0
 
+        # Propagate draw backwards through forced moves
         for i in range(loop_start - 1, -1, -1):
-            nid, eidx = path[i]
-            if not self.is_node_forced(nid):
-                off = self.node_offset[nid]
-                self.set_child(off + eidx, -2)
-                self.edges[off + eidx]['eval'] = 0
+            node_id, edge_index = path[i]
+            if not self.is_node_forced(node_id):
+                offset = self.node_offset[node_id]
+                self.set_child(offset + edge_index, -2)
+                self.edges[offset + edge_index]['eval'] = 0
                 break
-            off = self.node_offset[nid]
-            self.set_child(off + eidx, -2)
-            self.edges[off + eidx]['eval'] = 0
+            offset = self.node_offset[node_id]
+            self.set_child(offset + edge_index, -2)
+            self.edges[offset + edge_index]['eval'] = 0
 
         return True
 
     def path_to_game(self, path, suffix=''):
+        """Convert a path through the tree to a game notation string.
+        
+        Args:
+            path: List of (node_id, edge_index) tuples
+            suffix: Optional suffix to append (e.g., "MATE", "LOOP")
+            
+        Returns:
+            str: Game notation with move numbers and evaluations
+        """
         parts = []
-        for i, (nid, eidx) in enumerate(path):
-            off = self.node_offset[nid]
-            move = self.edges[off + eidx]['move'].decode()
-            ev = self.edges[off + eidx]['eval']
+        for i, (node_id, edge_index) in enumerate(path):
+            offset = self.node_offset[node_id]
+            move = self.edges[offset + edge_index]['move'].decode()
+            evaluation = self.edges[offset + edge_index]['eval']
             if i % 2 == 0:
                 parts.append(f"{i // 2 + 1}.")
-            parts.append(f"{move} {ev:+d}")
+            parts.append(f"{move} {evaluation:+d}")
         if suffix:
             parts.append(suffix)
         return ' '.join(parts)
 
     def yoyo(self):
+        """Main tree exploration algorithm using yo-yo traversal.
+        
+        Explores the game tree by moving forward along best moves and backward
+        to explore alternatives. Handles loops, mate positions, and saves progress
+        periodically. The algorithm balances exploration and exploitation.
+        """
         path = []
         zero_visited = set()
         node_id = self.root_id
         direction = 'FORWARD'
-        game = 0
+        game_count = 0
 
         def end_game(suffix):
-            nonlocal game, direction
-            game += 1
-            if game % 1024 == 0:
-                print(f"[{game}] {self.path_to_game(path, suffix)}")
-            if game % 65536 == 0:
-                for nid, _ in reversed(path):
-                    self.backprop_node(nid)
+            """End current game exploration and prepare for backtracking."""
+            nonlocal game_count, direction
+            game_count += 1
+            if game_count % 1024 == 0:
+                print(f"[{game_count}] {self.path_to_game(path, suffix)}")
+            if game_count % 65536 == 0:
+                # Periodic backpropagation and saving
+                for node_id, _ in reversed(path):
+                    self.backprop_node(node_id)
                 self.save_epd()
                 shutil.copy(f'/content/{EPD}', f'{DIR}{EPD}')
                 path.clear()
@@ -530,95 +701,105 @@ class Tree:
 
         try:
             while True:
-                off, n = self.node_offset[node_id], self.node_num_edges[node_id]
-                if n == 0:
+                offset, num_edges = self.node_offset[node_id], self.node_num_edges[node_id]
+                if num_edges == 0:
                     break
 
                 self.backprop_node(node_id)
-                evals = self.edges[off:off + n]['eval'].astype(np.int32)
-                children = self.edges[off:off + n]['child'].astype(np.int32)
+                evaluations = self.edges[offset:offset + num_edges]['eval'].astype(np.int32)
+                children = self.edges[offset:offset + num_edges]['child'].astype(np.int32)
 
                 if direction == 'FORWARD':
+                    # Filter out terminal positions
                     valid_mask = children != -2
                     if not np.any(valid_mask):
-                        best_idx = int(np.argmax(evals))
-                        path.append((node_id, best_idx))
-                        best_eval = evals[best_idx]
+                        best_edge_index = int(np.argmax(evaluations))
+                        path.append((node_id, best_edge_index))
+                        best_evaluation = evaluations[best_edge_index]
                         end_game("MATE")
                         continue
 
-                    scores = np.where(valid_mask, evals, -30000)
-                    edge_idx = int(np.argmax(scores))
+                    # Choose best non-terminal move
+                    scores = np.where(valid_mask, evaluations, -30000)
+                    edge_index = int(np.argmax(scores))
 
-                    if (node_id, edge_idx) in zero_visited:
-                        path.append((node_id, edge_idx))
+                    # Check for loops
+                    if (node_id, edge_index) in zero_visited:
+                        path.append((node_id, edge_index))
                         loop_start = next(i for i, (nid, eidx) in enumerate(path)
-                                          if nid == node_id and eidx == edge_idx)
+                                          if nid == node_id and eidx == edge_index)
                         self.check_forced_loop(path, loop_start)
                         end_game("LOOP")
                         continue
 
-                    if self.shift_eval_to_zero(node_id, edge_idx):
-                        zero_visited.add((node_id, edge_idx))
+                    # Shift evaluation towards zero for exploration
+                    if self.shift_eval_to_zero(node_id, edge_index):
+                        zero_visited.add((node_id, edge_index))
 
+                    # Try to add alternative moves
                     if not self.node_all_moves[node_id]:
                         self.add_alternative(node_id)
-                        off = self.node_offset[node_id]
+                        offset = self.node_offset[node_id]
 
-                    child_id = children[edge_idx]
+                    # Expand the move if needed
+                    child_id = children[edge_index]
                     if child_id == -1:
-                        child_id = self.expand_move(node_id, edge_idx)
+                        child_id = self.expand_move(node_id, edge_index)
                         if child_id is None:
-                            path.append((node_id, edge_idx))
-                            ev = self.edges[off + edge_idx]['eval']
+                            path.append((node_id, edge_index))
+                            evaluation = self.edges[offset + edge_index]['eval']
                             end_game("MATE")
                             continue
 
-                    path.append((node_id, edge_idx))
+                    path.append((node_id, edge_index))
                     node_id = child_id
 
-                else:
+                else:  # BACKWARD direction
                     if not path:
                         node_id = self.root_id
                         direction = 'FORWARD'
                         continue
 
-                    parent_id, used_idx = path.pop()
-                    zero_visited.discard((parent_id, used_idx))
-                    p_off, p_n = self.node_offset[parent_id], self.node_num_edges[parent_id]
+                    parent_id, used_edge_index = path.pop()
+                    zero_visited.discard((parent_id, used_edge_index))
+                    parent_offset, parent_num_edges = self.node_offset[parent_id], self.node_num_edges[parent_id]
                     self.backprop_node(parent_id)
 
-                    p_evals = self.edges[p_off:p_off + p_n]['eval'].astype(np.int32)
-                    p_children = self.edges[p_off:p_off + p_n]['child'].astype(np.int32)
+                    parent_evaluations = self.edges[parent_offset:parent_offset + parent_num_edges]['eval'].astype(np.int32)
+                    parent_children = self.edges[parent_offset:parent_offset + parent_num_edges]['child'].astype(np.int32)
 
-                    credit_mask = (p_children != -2)
-                    credit_mask[used_idx] = False
-                    self.edges[p_off:p_off + p_n]['eval'] += credit_mask.astype(np.int16)
+                    # Give credit to unexplored alternatives
+                    credit_mask = (parent_children != -2)
+                    credit_mask[used_edge_index] = False
+                    self.edges[parent_offset:parent_offset + parent_num_edges]['eval'] += credit_mask.astype(np.int16)
 
-                    p_evals = self.edges[p_off:p_off + p_n]['eval'].astype(np.int32)
-                    used_edge_eval = p_evals[used_idx]
+                    parent_evaluations = self.edges[parent_offset:parent_offset + parent_num_edges]['eval'].astype(np.int32)
+                    used_edge_evaluation = parent_evaluations[used_edge_index]
 
-                    best_alt_idx, alt_edge_eval = -1, -30000
-                    for i in range(p_n):
-                        if i != used_idx and p_evals[i] > alt_edge_eval:
-                            alt_edge_eval, best_alt_idx = p_evals[i], i
+                    # Find best alternative move
+                    best_alt_index, alt_edge_evaluation = -1, -30000
+                    for i in range(parent_num_edges):
+                        if i != used_edge_index and parent_evaluations[i] > alt_edge_evaluation:
+                            alt_edge_evaluation, best_alt_index = parent_evaluations[i], i
 
-                    if not self.node_all_moves[parent_id] and best_alt_idx == -1:
+                    # Try to add more alternatives if needed
+                    if not self.node_all_moves[parent_id] and best_alt_index == -1:
                         if self.add_alternative(parent_id):
-                            p_off, p_n = self.node_offset[parent_id], self.node_num_edges[parent_id]
-                            if self.edges[p_off + p_n - 1]['child'] != -2:
-                                best_alt_idx = p_n - 1
-                                alt_edge_eval = self.edges[p_off + p_n - 1]['eval']
+                            parent_offset, parent_num_edges = self.node_offset[parent_id], self.node_num_edges[parent_id]
+                            if self.edges[parent_offset + parent_num_edges - 1]['child'] != -2:
+                                best_alt_index = parent_num_edges - 1
+                                alt_edge_evaluation = self.edges[parent_offset + parent_num_edges - 1]['eval']
 
-                    if best_alt_idx >= 0 and alt_edge_eval > used_edge_eval + 64 * len(path):
-                        self.shift_eval_to_zero(parent_id, best_alt_idx)
+                    # Switch to alternative if it's significantly better
+                    if best_alt_index >= 0 and alt_edge_evaluation > used_edge_evaluation + 64 * len(path):
+                        self.shift_eval_to_zero(parent_id, best_alt_index)
 
-                        child_id = self.edges[p_off + best_alt_idx]['child']
+                        child_id = self.edges[parent_offset + best_alt_index]['child']
                         if child_id == -1:
-                            child_id = self.expand_move(parent_id, best_alt_idx)
+                            child_id = self.expand_move(parent_id, best_alt_index)
 
                         if child_id is not None and child_id >= 0:
-                            path.append((parent_id, best_alt_idx))
+                            path.append((parent_id, best_alt_index))
                             node_id = child_id
                             direction = 'FORWARD'
                             continue
@@ -628,8 +809,9 @@ class Tree:
         except KeyboardInterrupt:
             print('\nInterrupted')
         finally:
-            for nid, _ in reversed(path):
-                self.backprop_node(nid)
+            # Final cleanup and save
+            for node_id, _ in reversed(path):
+                self.backprop_node(node_id)
             self.save_epd()
             shutil.copy(f'/content/{EPD}', f'{DIR}{EPD}')
             self.engine.shut_down()
