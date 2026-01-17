@@ -42,7 +42,7 @@ Open the Colab notebook and configure:
 VARIANT = "atomic"    # Chess variant to analyze
 THREADS = 4           # CPU threads
 HASHMB  = 4096        # Hash table size in MB
-DEPTH   = 30          # Search depth per position
+DEPTH   = 5           # Search depth per position
 ```
 
 The notebook will:
